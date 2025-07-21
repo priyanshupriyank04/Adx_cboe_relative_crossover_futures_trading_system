@@ -822,4 +822,105 @@ def prepare_all_futures_data(adx_period=5):
     logging.info("All contracts updated with OHLC + indicators.")
 
 
-prepare_all_futures_data(adx_period=5)
+# prepare_all_futures_data(adx_period=5)
+
+import logging
+import pandas as pd
+
+def run_relative_strength_strategy():
+    """
+    Strategy 1 (3-day crossover check):
+    - Bearish Trigger: 
+        odd_bear crosses above odd_bull (on day -1 or 0)
+        AND di_minus crosses above di_plus (on day -1 or 0)
+        Crossovers can happen on different days within the last 2 days.
+
+    - Bullish Trigger:
+        odd_bull crosses above odd_bear (on day -1 or 0)
+        AND di_plus crosses above di_minus (on day -1 or 0)
+
+    Saves:
+        - bear_relative.csv  (bearish triggers, one contract per row)
+        - bull_relative.csv  (bullish triggers, one contract per row)
+    """
+    conn = connect_to_db()
+    if not conn:
+        logging.error("DB connection failed. Cannot run strategy.")
+        return
+
+    cur = conn.cursor()
+    cur.execute("SELECT tradingsymbol FROM current_month_futures;")
+    futures_list = cur.fetchall()
+
+    bear_triggers = []
+    bull_triggers = []
+
+    for (tradingsymbol,) in futures_list:
+        table_name = f"ohlc_{tradingsymbol.lower()}"
+        try:
+            # Check if table exists
+            cur.execute("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables 
+                    WHERE table_name = %s
+                );
+            """, (table_name,))
+            exists = cur.fetchone()[0]
+            if not exists:
+                continue
+
+            # Fetch last 3 rows (latest, -1, -2)
+            cur.execute(f"""
+                SELECT date, odd_bull, odd_bear, di_plus, di_minus
+                FROM {table_name}
+                ORDER BY date DESC
+                LIMIT 3;
+            """)
+            rows = cur.fetchall()
+            if len(rows) < 3:
+                continue  # Need 3 rows to confirm crossovers
+
+            df = pd.DataFrame(rows, columns=["date", "odd_bull", "odd_bear", "di_plus", "di_minus"])
+            df = df.astype(float, errors="ignore")
+            df = df.iloc[::-1].reset_index(drop=True)  # Oldest first for easy indexing
+
+            # Helper function to detect a crossover between two series
+            def detect_crossover(series1, series2, idx):
+                return series1[idx-1] <= series2[idx-1] and series1[idx] > series2[idx]
+
+            # Check for crossovers on -1 (yesterday) and 0 (today)
+            bear_cboe_cross = any(detect_crossover(df["odd_bear"], df["odd_bull"], idx) for idx in [1, 2])
+            bear_di_cross = any(detect_crossover(df["di_minus"], df["di_plus"], idx) for idx in [1, 2])
+
+            bull_cboe_cross = any(detect_crossover(df["odd_bull"], df["odd_bear"], idx) for idx in [1, 2])
+            bull_di_cross = any(detect_crossover(df["di_plus"], df["di_minus"], idx) for idx in [1, 2])
+
+            # Final triggers
+            if bear_cboe_cross and bear_di_cross:
+                bear_triggers.append(tradingsymbol)
+                logging.info(f"BEARISH TRIGGER: {tradingsymbol}")
+
+            if bull_cboe_cross and bull_di_cross:
+                bull_triggers.append(tradingsymbol)
+                logging.info(f"BULLISH TRIGGER: {tradingsymbol}")
+
+        except Exception as e:
+            logging.error(f"Error processing {table_name}: {e}")
+            continue
+
+    cur.close()
+    conn.close()
+
+    # Write to CSVs (one row per symbol)
+    with open("bear_relative.csv", "w", newline="") as f_bear:
+        for symbol in bear_triggers:
+            f_bear.write(symbol + "\n")
+
+    with open("bull_relative.csv", "w", newline="") as f_bull:
+        for symbol in bull_triggers:
+            f_bull.write(symbol + "\n")
+
+    logging.info(f"Strategy 1 completed. Bearish: {len(bear_triggers)}, Bullish: {len(bull_triggers)} contracts.")
+
+# Run the strategy
+run_relative_strength_strategy()
