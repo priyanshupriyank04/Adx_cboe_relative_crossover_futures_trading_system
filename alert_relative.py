@@ -22,8 +22,8 @@ logging.info(" Required libraries imported successfully.")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 #  API Credentials
-API_KEY = "api_key"  #  Replace with your actual API key
-API_SECRET = "secret_key"  # Replace with your actual API secret
+API_KEY = "8re7mjcm2btaozwf"  #  Replace with your actual API key
+API_SECRET = "fw8gm7wfeclcic9rlkp0tbzx4h2ss2n1"  # Replace with your actual API secret
 ACCESS_TOKEN_FILE = "access_token.txt"
 
 #  Initialize KiteConnect
@@ -670,3 +670,156 @@ def run_cboe_for_all_futures():
 # Run the CBOE indicator calculation for all current month futures
 # run_cboe_for_all_futures()
 
+def update_single_futures_ohlc(tradingsymbol: str, token: int, conn=None):
+    """
+    Updates OHLC data (50 previous daily candles + optional synthetic daily candle)
+    for a single current month futures contract.
+    If conn is provided, reuses the same DB connection (for master function).
+    """
+    # Use existing connection or create a new one
+    close_conn = False
+    if conn is None:
+        conn = connect_to_db()
+        close_conn = True
+
+    cur = conn.cursor()
+
+    today = datetime.date.today()
+    now = datetime.datetime.now().time()
+
+    is_holiday = today.strftime("%Y-%m-%d") in MARKET_HOLIDAYS
+    is_weekend = today.weekday() >= 5
+    is_after_open = now >= datetime.time(9, 15)
+    fetch_today = (not is_holiday) and (not is_weekend) and is_after_open
+
+    try:
+        table_name = f"ohlc_{tradingsymbol.lower()}"
+
+        # Ensure OHLC table exists (with volume)
+        create_table_query = f"""
+        CREATE TABLE IF NOT EXISTS {table_name} (
+            date DATE PRIMARY KEY,
+            open NUMERIC,
+            high NUMERIC,
+            low NUMERIC,
+            close NUMERIC,
+            volume NUMERIC
+        );
+        """
+        cur.execute(create_table_query)
+
+        # Add volume column if missing
+        cur.execute(f"""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns 
+                    WHERE table_name = '{table_name}' AND column_name = 'volume'
+                ) THEN
+                    ALTER TABLE {table_name} ADD COLUMN volume NUMERIC;
+                END IF;
+            END $$;
+        """)
+
+        # Clear old OHLC data
+        cur.execute(f"TRUNCATE TABLE {table_name};")
+
+        # Fetch last 50 daily candles (excluding today)
+        to_date = today
+        from_date = to_date - datetime.timedelta(days=80)
+        daily_candles = kite.historical_data(
+            instrument_token=token,
+            from_date=from_date,
+            to_date=to_date - datetime.timedelta(days=1),
+            interval="day"
+        )
+        df_daily = pd.DataFrame(daily_candles)[["date", "open", "high", "low", "close", "volume"]]
+
+        # Remove holidays and keep last 50 days
+        df_daily = df_daily[~df_daily["date"].dt.strftime("%Y-%m-%d").isin(MARKET_HOLIDAYS)]
+        df_daily = df_daily.tail(50)
+
+        # Add synthetic candle for today (hourly aggregation)
+        if fetch_today:
+            hourly_candles = kite.historical_data(
+                instrument_token=token,
+                from_date=today,
+                to_date=today,
+                interval="60minute"
+            )
+            df_hourly = pd.DataFrame(hourly_candles)[["date", "open", "high", "low", "close", "volume"]]
+            if not df_hourly.empty:
+                synthetic_row = {
+                    "date": today,
+                    "open": df_hourly.iloc[0]["open"],
+                    "high": df_hourly["high"].max(),
+                    "low": df_hourly["low"].min(),
+                    "close": df_hourly.iloc[-1]["close"],
+                    "volume": df_hourly["volume"].sum()
+                }
+                df_daily = pd.concat([df_daily, pd.DataFrame([synthetic_row])], ignore_index=True)
+
+        # Insert OHLC data into table
+        insert_query = f"""
+        INSERT INTO {table_name} (date, open, high, low, close, volume)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT (date) DO UPDATE
+        SET open = EXCLUDED.open,
+            high = EXCLUDED.high,
+            low = EXCLUDED.low,
+            close = EXCLUDED.close,
+            volume = EXCLUDED.volume;
+        """
+        for _, row in df_daily.iterrows():
+            cur.execute(insert_query, (
+                row["date"], row["open"], row["high"], row["low"], row["close"], row["volume"]
+            ))
+
+        conn.commit()
+        logging.info(f"Updated OHLC table for {tradingsymbol} with {len(df_daily)} rows (with volume).")
+
+        time.sleep(0.5)  # avoid hitting Kite API rate limits
+
+    except Exception as e:
+        logging.error(f"Failed to update OHLC for {tradingsymbol}: {e}")
+
+    if close_conn:
+        cur.close()
+        conn.close()
+
+
+def prepare_all_futures_data(adx_period=5):
+    """
+    Updates current month futures, fetches OHLC, 
+    and calculates ADX + CBOE in one unified loop.
+    """
+    # Step 1: Update current month futures
+    update_current_month_futures()
+
+    # Step 2: Fetch futures list
+    conn = connect_to_db()
+    cur = conn.cursor()
+    cur.execute("SELECT tradingsymbol, instrument_token FROM current_month_futures;")
+    futures_list = cur.fetchall()
+
+    for tradingsymbol, token in futures_list:
+        logging.info(f"Processing {tradingsymbol}...")
+
+        # Step 3: Update OHLC (50 days + today) for this contract
+        update_single_futures_ohlc(tradingsymbol, token, conn)
+
+        # Step 4: Run ADX
+        table_name = f"ohlc_{tradingsymbol.lower()}"
+        calculate_adx_for_table(table_name, period=adx_period)
+
+        # Step 5: Run CBOE
+        calculate_cboe_for_table(table_name)
+
+        logging.info(f"Completed {tradingsymbol}")
+
+    cur.close()
+    conn.close()
+    logging.info("All contracts updated with OHLC + indicators.")
+
+
+prepare_all_futures_data(adx_period=5)
