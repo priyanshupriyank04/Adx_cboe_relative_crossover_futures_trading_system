@@ -891,6 +891,11 @@ def run_absolute_threshold_strategy():
             # Helper for detecting CROSS BELOW a fixed level
             def detect_level_cross_below(series, level, idx):
                 return series[idx-1] >= level and series[idx] < level
+        
+            # Helper to check if the most recent value (today) is strictly below a threshold
+            def is_strictly_below(series, level):
+                return len(series) > 0 and series.iloc[-1] < level
+
 
             # Bullish (weak bearishness fading): odd_bear & di_minus cross BELOW
             bull_cboe_cross = any(detect_level_cross_below(df["odd_bear"], 15, idx) for idx in [1, 2])
@@ -900,12 +905,20 @@ def run_absolute_threshold_strategy():
             bear_cboe_cross = any(detect_level_cross_below(df["odd_bull"], 15, idx) for idx in [1, 2])
             bear_di_cross = any(detect_level_cross_below(df["di_plus"], 9, idx) for idx in [1, 2])
 
+
+            bull_strict_cboe = is_strictly_below(df["odd_bear"], 15)
+            bull_strict_di = is_strictly_below(df["di_minus"], 9)
+
+            bear_strict_cboe = is_strictly_below(df["odd_bull"], 15)
+            bear_strict_di = is_strictly_below(df["di_plus"], 9)
+
+
             # Final triggers
-            if bull_cboe_cross and bull_di_cross:
+            if bull_cboe_cross and bull_di_cross and bull_strict_cboe and bull_strict_di:
                 bullish_triggers.append(tradingsymbol)
                 logging.info(f"BULLISH ABSOLUTE TRIGGER (Cross Below): {tradingsymbol}")
 
-            if bear_cboe_cross and bear_di_cross:
+            if bear_cboe_cross and bear_di_cross and bear_strict_cboe and bear_strict_di:
                 bearish_triggers.append(tradingsymbol)
                 logging.info(f"BEARISH ABSOLUTE TRIGGER (Cross Below): {tradingsymbol}")
 
@@ -996,6 +1009,12 @@ def run_relative_strength_strategy():
             def detect_crossover(series1, series2, idx):
                 return series1[idx-1] <= series2[idx-1] and series1[idx] > series2[idx]
 
+            
+            # Helper for strict relative check (series1 must still be above series2 at latest idx)
+            def is_strictly_above(series1, series2, idx):
+                return series1[idx] > series2[idx]
+
+            
             # Check for crossovers on -1 (yesterday) and 0 (today)
             bear_cboe_cross = any(detect_crossover(df["odd_bear"], df["odd_bull"], idx) for idx in [1, 2])
             bear_di_cross = any(detect_crossover(df["di_minus"], df["di_plus"], idx) for idx in [1, 2])
@@ -1003,12 +1022,16 @@ def run_relative_strength_strategy():
             bull_cboe_cross = any(detect_crossover(df["odd_bull"], df["odd_bear"], idx) for idx in [1, 2])
             bull_di_cross = any(detect_crossover(df["di_plus"], df["di_minus"], idx) for idx in [1, 2])
 
+             # Strict relative condition (latest candle must still be in correct relation)
+            bear_strict = is_strictly_above(df["odd_bear"], df["odd_bull"], 2) and is_strictly_above(df["di_minus"], df["di_plus"], 2)
+            bull_strict = is_strictly_above(df["odd_bull"], df["odd_bear"], 2) and is_strictly_above(df["di_plus"], df["di_minus"], 2)
+            
             # Final triggers
-            if bear_cboe_cross and bear_di_cross:
+            if bear_cboe_cross and bear_di_cross and bear_strict:
                 bear_triggers.append(tradingsymbol)
                 logging.info(f"BEARISH TRIGGER: {tradingsymbol}")
 
-            if bull_cboe_cross and bull_di_cross:
+            if bull_cboe_cross and bull_di_cross and bull_strict:
                 bull_triggers.append(tradingsymbol)
                 logging.info(f"BULLISH TRIGGER: {tradingsymbol}")
 
